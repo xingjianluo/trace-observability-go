@@ -21,12 +21,25 @@ const (
 	LevelError
 )
 
-func (l Level) String() string { return "" }
+func (l Level) String() string {
+	switch l {
+	case LevelDebug:
+		return "debug"
+	case LevelInfo:
+		return "info"
+	case LevelWarn:
+		return "warn"
+	case LevelError:
+		return "error"
+	default:
+		return "unknown"
+	}
+}
 
 // Field is one structured key/value pair.
 type Field struct {
-	Key   string
-	Value any
+	Key   string `json:"key"`
+	Value any    `json:"value"`
 }
 
 // F is shorthand for constructing a Field.
@@ -34,14 +47,14 @@ func F(key string, value any) Field { return Field{Key: key, Value: value} }
 
 // Entry is the redacted, serializable record handed to sinks.
 type Entry struct {
-	Time    time.Time
-	Level   Level
-	Message string
-	TraceID string
-	SpanID  string
-	ParentID string
-	Depth   int
-	Fields  []Field
+	Time     time.Time `json:"time"`
+	Level    Level     `json:"level"`
+	Message  string    `json:"message"`
+	TraceID  string    `json:"trace_id,omitempty"`
+	SpanID   string    `json:"span_id,omitempty"`
+	ParentID string    `json:"parent_id,omitempty"`
+	Depth    int       `json:"depth"`
+	Fields   []Field   `json:"fields,omitempty"`
 }
 
 // Sink receives completed entries. Must be concurrency-safe.
@@ -52,14 +65,16 @@ type Sink interface {
 // SinkFunc adapts a function to Sink.
 type SinkFunc func(Entry)
 
-func (f SinkFunc) Write(e Entry) {}
+func (f SinkFunc) Write(e Entry) { f(e) }
 
 // Logger resolves correlation information from contexts and applies
 // redaction before entries reach the sink.
 type Logger struct {
-	sink  Sink
-	redact func(Entry) Entry
-	now   func() time.Time
+	sink       Sink
+	redactor   *Redactor
+	now        func() time.Time
+	minLevel   Level
+	fixed      []Field
 }
 
 // Config configures a Logger.
@@ -72,14 +87,57 @@ type Config struct {
 
 // New builds a Logger. redactor may be nil, in which case entries
 // pass through unchanged.
-func New(sink Sink, redactor func(Entry) Entry, cfg Config) *Logger { return &Logger{} }
+func New(sink Sink, redactor *Redactor, cfg Config) *Logger {
+	return &Logger{
+		sink:     sink,
+		redactor: redactor,
+		now:      time.Now,
+		minLevel: cfg.MinLevel,
+		fixed:    append([]Field(nil), cfg.ExtraFixed...),
+	}
+}
 
 // Log emits one entry at level, correlating it with the span on ctx.
-func (l *Logger) Log(ctx context.Context, level Level, msg string, fields ...Field) {}
+// Redaction happens before the entry touches the sink, so no sink
+// implementation can observe an unredacted value.
+func (l *Logger) Log(ctx context.Context, level Level, msg string, fields ...Field) {
+	if level < l.minLevel {
+		return
+	}
+	e := Entry{
+		Time:    l.now(),
+		Level:   level,
+		Message: msg,
+		Depth:   -1,
+	}
+	if sp := tracing.SpanFromContext(ctx); sp != nil {
+		sc := sp.SpanContext()
+		e.TraceID = sc.TraceID.Hex()
+		e.SpanID = sc.SpanID.Hex()
+		if pid := sp.ParentID(); pid != (tracing.SpanID{}) {
+			e.ParentID = pid.Hex()
+		}
+		e.Depth = sp.Depth()
+	}
+	if len(l.fixed) > 0 {
+		e.Fields = append(e.Fields, l.fixed...)
+	}
+	e.Fields = append(e.Fields, fields...)
+	if l.redactor != nil {
+		e = l.redactor.Apply(e)
+	}
+	l.sink.Write(e)
+}
 
-func (l *Logger) Debug(ctx context.Context, msg string, fields ...Field) {}
-func (l *Logger) Info(ctx context.Context, msg string, fields ...Field)  {}
-func (l *Logger) Warn(ctx context.Context, msg string, fields ...Field)  {}
-func (l *Logger) Error(ctx context.Context, msg string, fields ...Field) {}
-
-var _ = tracing.SpanContext{}
+func (l *Logger) Debug(ctx context.Context, msg string, fields ...Field) {
+	l.Log(ctx, LevelDebug, msg, fields...)
+}
+func (l *Logger) Info(ctx context.Context, msg string, fields ...Field) {
+	l.Log(ctx, LevelInfo, msg, fields...)
+}
+func (l *Logger) Warn(ctx context.Context, msg string, fields ...Field) {
+	l.Log(ctx, LevelWarn, msg, fields...)
+}
+func (l *Logger) Error(ctx context.Context, msg string, fields ...Field) {
+	l.Log(ctx, LevelError, msg, fields...)
+}
