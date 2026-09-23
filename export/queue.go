@@ -53,19 +53,23 @@ const (
 	PolicyDropNewest
 )
 
-// Queue is a bounded, concurrency-safe queue.
+// Queue is a bounded, concurrency-safe queue. The data channel is
+// never closed (closing it would race with blocked senders);
+// shutdown is broadcast on a separate channel, and in-flight
+// producers are tracked by a WaitGroup.
 type Queue struct {
 	ch     chan Envelope
 	policy Policy
 
-	mu     sync.RWMutex
-	closed bool
+	closeOnce sync.Once
+	closeCh   chan struct{}
+
+	inFlight sync.WaitGroup // Enqueue calls past the closed-check
 
 	accepted atomic.Int64
 	dropped  atomic.Int64
 
 	dropCh chan DropEvent
-	closeCh chan struct{}
 }
 
 // NewQueue creates a queue of the given capacity (must be > 0).
@@ -74,12 +78,10 @@ func NewQueue(capacity int, policy Policy) *Queue {
 		capacity = 1
 	}
 	return &Queue{
-		ch:     make(chan Envelope, capacity),
-		policy: policy,
-		// Buffer a few drop notifications; if the observer is slow
-		// drops are still reflected by DroppedTotal.
-		dropCh:  make(chan DropEvent, 16),
+		ch:      make(chan Envelope, capacity),
+		policy:  policy,
 		closeCh: make(chan struct{}),
+		dropCh:  make(chan DropEvent, 16),
 	}
 }
 
@@ -95,11 +97,17 @@ func (q *Queue) Enqueue(ctx context.Context, e Envelope) error {
 		q.countDrop(e.Kind, DropQueueClosed)
 		return ErrQueueClosed
 	}
+	q.inFlight.Add(1)
+	defer q.inFlight.Done()
+
 	if q.policy == PolicyDropNewest {
 		select {
 		case q.ch <- e:
 			q.accepted.Add(1)
 			return nil
+		case <-q.closeCh:
+			q.countDrop(e.Kind, DropQueueClosed)
+			return ErrQueueClosed
 		default:
 			q.countDrop(e.Kind, DropQueueFull)
 			return nil
@@ -127,27 +135,33 @@ func (q *Queue) countDrop(k Kind, r DropReason) {
 }
 
 // Close marks the queue closed; blocked producers are released with
-// ErrQueueClosed. Buffered items remain readable until drained.
-// Close is idempotent.
+// ErrQueueClosed (the data channel itself stays open). Buffered and
+// in-flight items remain readable. Close is idempotent.
 func (q *Queue) Close() {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
-		return
-	}
-	q.closed = true
-	close(q.ch)
-	close(q.closeCh)
-	q.mu.Unlock()
+	q.closeOnce.Do(func() { close(q.closeCh) })
 }
+
+// Wait blocks until every Enqueue call that passed the initial
+// closed-check has finished either by sending or by observing Close.
+// Batched shutdown uses it to avoid losing an in-flight accepted
+// send.
+func (q *Queue) Wait() { q.inFlight.Wait() }
 
 func (q *Queue) isClosed() bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.closed
+	select {
+	case <-q.closeCh:
+		return true
+	default:
+		return false
+	}
 }
 
-// C returns the receive channel consumed by the batcher.
+// Closed reports whether Close has been called.
+func (q *Queue) Closed() bool { return q.isClosed() }
+
+// C returns the receive channel consumed by the batcher. It is never
+// closed; consumers must use Closed()/Wait() plus len to detect
+// end-of-drain.
 func (q *Queue) C() <-chan Envelope { return q.ch }
 
 // AcceptedTotal returns the cumulative number of enqueued items.
@@ -164,3 +178,7 @@ type DropEvent struct {
 
 // Drops returns the channel on which drop events are reported.
 func (q *Queue) Drops() <-chan DropEvent { return q.dropCh }
+
+// closedSignal exposes the close notification channel to the
+// batcher without making it part of the wider API contract.
+func (q *Queue) closedSignal() <-chan struct{} { return q.closeCh }

@@ -99,21 +99,27 @@ func (b *Batcher) Run(ctx context.Context) error {
 		return nil
 	}
 
+	closedCh := b.queue.closedSignal()
 	for {
-		select {
-		case e, ok := <-b.queue.C():
-			if !ok {
-				// Queue closed: drain any remaining buffered items.
-				for e := range b.queue.C() {
-					batch = append(batch, e)
-					if len(batch) >= b.cfg.MaxBatchSize {
-						if err := flush(); err != nil {
-							return err
-						}
+		// Once the queue is closed, keep draining until producers
+		// have all settled and the buffer is empty. The data channel
+		// is deliberately never closed, so length+Wait is the
+		// end-of-drain condition.
+		if b.queue.Closed() {
+			b.queue.Wait()
+			for len(b.queue.C()) > 0 {
+				e := <-b.queue.C()
+				batch = append(batch, e)
+				if len(batch) >= b.cfg.MaxBatchSize {
+					if err := flush(); err != nil {
+						return err
 					}
 				}
-				return flush()
 			}
+			return flush()
+		}
+		select {
+		case e := <-b.queue.C():
 			batch = append(batch, e)
 			if len(batch) >= b.cfg.MaxBatchSize {
 				if err := flush(); err != nil {
@@ -131,6 +137,8 @@ func (b *Batcher) Run(ctx context.Context) error {
 			// cannot strand an accepted-but-unflushed batch.
 			_ = flush()
 			return ctx.Err()
+		case <-closedCh:
+			// Loop around into the drain branch above.
 		}
 	}
 }

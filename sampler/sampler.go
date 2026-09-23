@@ -52,14 +52,15 @@ func (s *Ratio) RuleID() string { return fmt.Sprintf("ratio:%g", s.ratio) }
 
 func (s *Ratio) Decide(id tracing.TraceID, name string) Decision {
 	h := hashTraceID(id)
-	// Uniform in [0, scale): use the low 32 bits of the 64-bit
-	// FNV hash after modulo scale (scale is a power of two, so this
-	// is a clean bit mask).
-	bucket := h % scale
+	// FNV-1a has weak low-bit avalanche, so similar inputs would
+	// collide in low buckets. Mix64 (a splitmix64 finalizer, public
+	// domain) spreads the hash across all 64 bits before taking the
+	// top 32 bits as the bucket.
+	bucket := mix64(h) >> 32
 	sampled := bucket < s.threshold
 	reason := fmt.Sprintf(
-		"trace=%s fnv1a64%%2^32=%d threshold=%d (ratio=%g): %s",
-		id.Hex(), bucket, s.threshold, s.ratio,
+		"trace=%s fnv1a64=%016x mix64hi=%08x threshold=%08x (ratio=%g): %s",
+		id.Hex(), h, bucket, s.threshold, s.ratio,
 		map[bool]string{true: "keep", false: "drop"}[sampled])
 	return Decision{
 		Sampled: sampled,
@@ -119,12 +120,22 @@ func (s *NameRules) Decide(id tracing.TraceID, name string) Decision {
 }
 
 // hashTraceID returns the FNV-1a 64-bit hash of the raw trace id
-// bytes. FNV is not cryptographic; we only need a stable, well-spread
-// bucket assignment.
+// bytes. FNV is not cryptographic; it is only the first, stable step
+// of the bucket computation (see mix64).
 func hashTraceID(id tracing.TraceID) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write(id[:])
 	return h.Sum64()
+}
+
+// mix64 is the splitmix64 finalizer by Stafford/Vigna. It turns the
+// FNV digest into a well-avalanched value whose high 32 bits are an
+// unbiased bucket in [0, 2^32).
+func mix64(z uint64) uint64 {
+	z += 0x9e3779b97f4a7c15
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
 }
 
 // AlwaysOn and AlwaysOff are trivial samplers for tests/config.

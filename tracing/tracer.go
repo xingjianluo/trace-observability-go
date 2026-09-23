@@ -127,8 +127,14 @@ func (t *Tracer) Start(ctx context.Context, name string, opts ...SpanOption) (co
 			if t.rec != nil {
 				t.rec.RecordSpan(d)
 			}
-		})
-	go s.watchCancellation(ctx, isRoot)
+		}, isRoot)
+	go s.watchCancellation(ctx)
+	// A span created from an already-cancelled context is born
+	// cancelled: finish() reads the caller context and records the
+	// propagated reason; End stays idempotent if the caller calls it.
+	if ctx.Err() != nil {
+		s.finish(ReasonFinished)
+	}
 	return s.Context(), s
 }
 

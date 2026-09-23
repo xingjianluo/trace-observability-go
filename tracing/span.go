@@ -113,8 +113,10 @@ type span struct {
 	depth   int
 	startAt time.Time
 	ctx     context.Context
-	now     func() time.Time
-	onEnd   func(SpanData)
+	now       func() time.Time
+	onEnd     func(SpanData)
+	callerCtx context.Context
+	bornRoot  bool
 
 	// Mutable state guarded by mu.
 	mu        sync.Mutex
@@ -129,18 +131,20 @@ type span struct {
 
 func newSpan(sc SpanContext, parent SpanID, name string, kind Kind, depth int,
 	startAt time.Time, ctx context.Context, now func() time.Time,
-	onEnd func(SpanData)) *span {
+	onEnd func(SpanData), isRoot bool) *span {
 	s := &span{
-		sc:      sc,
-		parent:  parent,
-		name:    name,
-		kind:    kind,
-		depth:   depth,
-		startAt: startAt,
-		ctx:     withSpan(ctx, nil),
-		now:     now,
-		onEnd:   onEnd,
-		done:    make(chan struct{}),
+		sc:        sc,
+		parent:    parent,
+		name:      name,
+		kind:      kind,
+		depth:     depth,
+		startAt:   startAt,
+		ctx:       withSpan(ctx, nil),
+		now:       now,
+		onEnd:     onEnd,
+		done:      make(chan struct{}),
+		callerCtx: ctx,
+		bornRoot:  isRoot,
 	}
 	s.ctx = withSpan(ctx, s)
 	return s
@@ -186,9 +190,18 @@ func (s *span) End() { s.finish(ReasonFinished) }
 
 // finish ends the span with the given reason. It is safe to call from
 // multiple goroutines: exactly one caller wins and produces the
-// exported snapshot.
+// exported snapshot. When an explicit finish races an already-visible
+// cancellation of the caller context, cancellation wins, because the
+// operation's real termination cause is the cancellation.
 func (s *span) finish(reason EndReason) {
 	s.endOnce.Do(func() {
+		if reason == ReasonFinished && s.callerCtx != nil && s.callerCtx.Err() != nil {
+			if s.bornRoot {
+				reason = ReasonContextDone
+			} else {
+				reason = ReasonParentCancel
+			}
+		}
 		s.mu.Lock()
 		data := SpanData{
 			TraceID:      s.sc.TraceID,
@@ -217,17 +230,14 @@ func (s *span) Context() context.Context { return s.ctx }
 func (s *span) Depth() int                  { return s.depth }
 
 // watchCancellation ends the span when the caller-supplied context
-// is cancelled. A non-root span whose parent context fired records
-// parent_cancelled; a root records context_cancelled. The watcher
-// also exits promptly when the span ends normally.
-func (s *span) watchCancellation(parentCtx context.Context, isRoot bool) {
+// is cancelled. The concrete reason (parent_cancelled vs
+// context_cancelled vs an explicit End winning the race) is decided
+// centrally in finish, so the watcher only has to trigger it. The
+// watcher exits promptly when the span ends normally.
+func (s *span) watchCancellation(parentCtx context.Context) {
 	select {
 	case <-parentCtx.Done():
-		if isRoot {
-			s.finish(ReasonContextDone)
-		} else {
-			s.finish(ReasonParentCancel)
-		}
+		s.finish(ReasonFinished)
 	case <-s.done:
 	}
 }
