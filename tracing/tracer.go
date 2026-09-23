@@ -187,12 +187,12 @@ type noopSpan struct {
 	ctx    context.Context
 }
 
-func (n *noopSpan) Depth() int                             { return n.depth }
-func (n *noopSpan) SpanContext() SpanContext              { return n.sc }
-func (n *noopSpan) ParentID() SpanID                      { return n.parent }
-func (n *noopSpan) SetAttribute(string, any)              {}
-func (n *noopSpan) AddEvent(string, map[string]any)       {}
-func (n *noopSpan) RecordError(error)                     {}
-func (n *noopSpan) End()                                  {}
-func (n *noopSpan) Done() <-chan struct{}                 { return nil }
-func (n *noopSpan) Context() context.Context              { return n.ctx }
+func (n *noopSpan) Depth() int                      { return n.depth }
+func (n *noopSpan) SpanContext() SpanContext        { return n.sc }
+func (n *noopSpan) ParentID() SpanID                { return n.parent }
+func (n *noopSpan) SetAttribute(string, any)        {}
+func (n *noopSpan) AddEvent(string, map[string]any) {}
+func (n *noopSpan) RecordError(error)               {}
+func (n *noopSpan) End()                            {}
+func (n *noopSpan) Done() <-chan struct{}           { return nil }
+func (n *noopSpan) Context() context.Context        { return n.ctx }

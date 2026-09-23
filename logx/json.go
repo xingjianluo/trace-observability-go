@@ -5,13 +5,13 @@ import (
 )
 
 type jsonEntry struct {
-	Time     string    `json:"time"`
-	Level    string    `json:"level"`
-	Message  string    `json:"message"`
-	TraceID  string    `json:"trace_id,omitempty"`
-	SpanID   string    `json:"span_id,omitempty"`
-	ParentID string    `json:"parent_id,omitempty"`
-	Depth    int       `json:"depth"`
+	Time     string      `json:"time"`
+	Level    string      `json:"level"`
+	Message  string      `json:"message"`
+	TraceID  string      `json:"trace_id,omitempty"`
+	SpanID   string      `json:"span_id,omitempty"`
+	ParentID string      `json:"parent_id,omitempty"`
+	Depth    int         `json:"depth"`
 	Fields   []jsonField `json:"fields,omitempty"`
 }
 

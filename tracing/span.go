@@ -52,18 +52,18 @@ type Event struct {
 
 // SpanData is the immutable snapshot exported after a span ends.
 type SpanData struct {
-	TraceID      TraceID         `json:"trace_id"`
-	SpanID       SpanID          `json:"span_id"`
-	ParentSpanID SpanID          `json:"parent_span_id"`
-	Name         string          `json:"name"`
-	Kind         Kind            `json:"kind"`
-	Start        time.Time       `json:"start"`
-	End          time.Time       `json:"end"`
-	EndReason    EndReason       `json:"end_reason"`
-	Attributes   map[string]any  `json:"attributes,omitempty"`
-	Events       []Event         `json:"events,omitempty"`
-	StatusError  string          `json:"status_error,omitempty"`
-	Depth        int             `json:"depth"`
+	TraceID      TraceID        `json:"trace_id"`
+	SpanID       SpanID         `json:"span_id"`
+	ParentSpanID SpanID         `json:"parent_span_id"`
+	Name         string         `json:"name"`
+	Kind         Kind           `json:"kind"`
+	Start        time.Time      `json:"start"`
+	End          time.Time      `json:"end"`
+	EndReason    EndReason      `json:"end_reason"`
+	Attributes   map[string]any `json:"attributes,omitempty"`
+	Events       []Event        `json:"events,omitempty"`
+	StatusError  string         `json:"status_error,omitempty"`
+	Depth        int            `json:"depth"`
 }
 
 // Span is an in-progress operation. All methods are safe for
@@ -106,13 +106,13 @@ func SpanStart(t time.Time) SpanOption {
 // span is the concrete Span implementation.
 type span struct {
 	// Immutable identity / metadata.
-	sc      SpanContext
-	parent  SpanID
-	name    string
-	kind    Kind
-	depth   int
-	startAt time.Time
-	ctx     context.Context
+	sc        SpanContext
+	parent    SpanID
+	name      string
+	kind      Kind
+	depth     int
+	startAt   time.Time
+	ctx       context.Context
 	now       func() time.Time
 	onEnd     func(SpanData)
 	callerCtx context.Context
@@ -227,7 +227,7 @@ func (s *span) finish(reason EndReason) {
 
 func (s *span) Done() <-chan struct{}    { return s.done }
 func (s *span) Context() context.Context { return s.ctx }
-func (s *span) Depth() int                  { return s.depth }
+func (s *span) Depth() int               { return s.depth }
 
 // watchCancellation ends the span when the caller-supplied context
 // is cancelled. The concrete reason (parent_cancelled vs
@@ -254,18 +254,18 @@ func cloneMap(in map[string]any) map[string]any {
 }
 
 type jsonSpanData struct {
-	TraceID      string        `json:"trace_id"`
-	SpanID       string        `json:"span_id"`
-	ParentSpanID string        `json:"parent_span_id"`
-	Name         string        `json:"name"`
-	Kind         string        `json:"kind"`
-	Start        string        `json:"start"`
-	End          string        `json:"end"`
-	EndReason    EndReason     `json:"end_reason"`
+	TraceID      string         `json:"trace_id"`
+	SpanID       string         `json:"span_id"`
+	ParentSpanID string         `json:"parent_span_id"`
+	Name         string         `json:"name"`
+	Kind         string         `json:"kind"`
+	Start        string         `json:"start"`
+	End          string         `json:"end"`
+	EndReason    EndReason      `json:"end_reason"`
 	Attributes   map[string]any `json:"attributes,omitempty"`
-	Events       []jsonEvent   `json:"events,omitempty"`
-	StatusError  string        `json:"status_error,omitempty"`
-	Depth        int           `json:"depth"`
+	Events       []jsonEvent    `json:"events,omitempty"`
+	StatusError  string         `json:"status_error,omitempty"`
+	Depth        int            `json:"depth"`
 }
 
 type jsonEvent struct {
@@ -280,16 +280,16 @@ const rfc3339NanoUTC = "2006-01-02T15:04:05.000000000Z"
 // RFC3339Nano timestamps for stable, readable JSONL.
 func (d SpanData) MarshalJSON() ([]byte, error) {
 	j := jsonSpanData{
-		TraceID:      d.TraceID.Hex(),
-		SpanID:       d.SpanID.Hex(),
-		Name:         d.Name,
-		Kind:         d.Kind.String(),
-		Start:        d.Start.UTC().Format(rfc3339NanoUTC),
-		End:          d.End.UTC().Format(rfc3339NanoUTC),
-		EndReason:    d.EndReason,
-		Attributes:   d.Attributes,
-		StatusError:  d.StatusError,
-		Depth:        d.Depth,
+		TraceID:     d.TraceID.Hex(),
+		SpanID:      d.SpanID.Hex(),
+		Name:        d.Name,
+		Kind:        d.Kind.String(),
+		Start:       d.Start.UTC().Format(rfc3339NanoUTC),
+		End:         d.End.UTC().Format(rfc3339NanoUTC),
+		EndReason:   d.EndReason,
+		Attributes:  d.Attributes,
+		StatusError: d.StatusError,
+		Depth:       d.Depth,
 	}
 	if pid := d.ParentSpanID; pid != (SpanID{}) {
 		j.ParentSpanID = pid.Hex()

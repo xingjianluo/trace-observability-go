@@ -70,11 +70,11 @@ func (f SinkFunc) Write(e Entry) { f(e) }
 // Logger resolves correlation information from contexts and applies
 // redaction before entries reach the sink.
 type Logger struct {
-	sink       Sink
-	redactor   *Redactor
-	now        func() time.Time
-	minLevel   Level
-	fixed      []Field
+	sink     Sink
+	redactor *Redactor
+	now      func() time.Time
+	minLevel Level
+	fixed    []Field
 }
 
 // Config configures a Logger.

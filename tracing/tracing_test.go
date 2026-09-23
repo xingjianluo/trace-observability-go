@@ -69,10 +69,10 @@ func TestContextPropagationParentChild(t *testing.T) {
 	// One trace, correct parent links, correct depths.
 	trace := byName["root"].TraceID
 	cases := []struct {
-		name        string
-		parent      string
-		depth       int
-		reason      tracing.EndReason
+		name   string
+		parent string
+		depth  int
+		reason tracing.EndReason
 	}{
 		{"root", "", 0, tracing.ReasonFinished},
 		{"child-1", "root", 1, tracing.ReasonFinished},
@@ -196,7 +196,7 @@ func TestParentCancellationPropagates(t *testing.T) {
 	cancelledChildEnded := make(chan struct{})
 	j1 := tr.Go(ctx, "cancelled-child", func(ctx context.Context, sp tracing.Span) {
 		<-ctx.Done() // simulate cooperative work noticing cancellation
-		<-sp.Done() // span must be ended by propagated cancellation
+		<-sp.Done()  // span must be ended by propagated cancellation
 		close(cancelledChildEnded)
 	})
 	j2 := tr.Go(ctx, "self-finishing-child", func(ctx context.Context, sp tracing.Span) {

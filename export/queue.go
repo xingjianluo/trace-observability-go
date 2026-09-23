@@ -21,9 +21,9 @@ const (
 // tracing.SpanData or logx.Entry; it is typed as any to keep the
 // export package free of import cycles.
 type Envelope struct {
-	Kind      Kind `json:"kind"`
+	Kind      Kind  `json:"kind"`
 	Timestamp int64 `json:"timestamp_ns"`
-	Payload   any  `json:"payload"`
+	Payload   any   `json:"payload"`
 }
 
 // DropReason says why an item was rejected.
