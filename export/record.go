@@ -8,6 +8,7 @@ type Kind int
 const (
 	KindSpan Kind = iota
 	KindLog
+	KindGroup
 )
 
 func (k Kind) String() string {
@@ -16,6 +17,8 @@ func (k Kind) String() string {
 		return "span"
 	case KindLog:
 		return "log"
+	case KindGroup:
+		return "group_summary"
 	default:
 		return "unknown"
 	}

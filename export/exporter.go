@@ -118,23 +118,40 @@ func New(w io.Writer, opts ...Option) *Exporter {
 // ErrClosed 在 Shutdown 之后再调用 Enqueue 时返回。
 var ErrClosed = errors.New("export: exporter closed")
 
-// Enqueue 将一条记录放入有界队列。
-//   - DropNewest：满时丢弃本条，DroppedNew +1；
-//   - DropOldest：满时丢弃队首旧条，DroppedOld +1，本条入队；
-//   - BlockCaller：阻塞直到有空位；Shutdown 时返回 ErrClosed。
-func (e *Exporter) Enqueue(ctx context.Context, r Record) error {
+// MissingReason 常量描述一条“未被纳入统计”的记录的原因，
+// 由 Submit 的回执携带，供业务组做覆盖统计。
+const (
+	MissingDroppedNew   = "queue_dropped_new"
+	MissingDroppedOld   = "queue_dropped_old"
+	MissingExporterGone = "exporter_closed"
+)
+
+// Result 是 Submit 的投递回执，调用方据此区分
+// “实际进入队列”与“没能纳入（及为什么没能纳入）”。
+type Result struct {
+	Accepted      bool   // 是否真正进入队列
+	MissingReason string // 未纳入原因；Accepted=true 时为空
+}
+
+// Submit 将一条记录放入有界队列并返回明确回执。语义同 Enqueue，
+// 区别在于丢弃/关闭时通过 Result 告知具体原因，而不是静默成功。
+//   - DropNewest：满时丢弃本条，回执 {Accepted:false, MissingReason:MissingDroppedNew}；
+//   - DropOldest：满时丢弃队首旧条，本条入队；被丢弃旧条的原因记录在 DroppedOld 计数中；
+//   - BlockCaller：阻塞直到有空位（Accepted=true）；ctx 取消返回 ctx 错误；
+//   - Shutdown 之后：返回 ErrClosed，回执 MissingReason=MissingExporterGone。
+func (e *Exporter) Submit(ctx context.Context, r Record) (Result, error) {
 	e.mu.Lock()
 	for len(e.queue) >= e.capacity && !e.closed {
 		if e.policy == BlockCaller {
 			if err := ctx.Err(); err != nil {
 				e.mu.Unlock()
-				return err
+				return Result{Accepted: false}, err
 			}
 			// cond.Wait 期间释放锁；用 watcher 在 ctx 取消或 stop 时唤醒。
 			// e.waitLocked 返回后 watcher 一定会退出，不会泄漏协程。
 			if err := e.waitLocked(ctx); err != nil {
 				e.mu.Unlock()
-				return err
+				return Result{Accepted: false}, err
 			}
 			continue
 		}
@@ -145,17 +162,26 @@ func (e *Exporter) Enqueue(ctx context.Context, r Record) error {
 		}
 		e.stats.DroppedNew++
 		e.mu.Unlock()
-		return nil
+		return Result{Accepted: false, MissingReason: MissingDroppedNew}, nil
 	}
 	if e.closed {
 		e.mu.Unlock()
-		return ErrClosed
+		return Result{Accepted: false, MissingReason: MissingExporterGone}, ErrClosed
 	}
 	e.queue = append(e.queue, r)
 	e.stats.Enqueued++
 	e.mu.Unlock()
 	e.cond.Signal()
-	return nil
+	return Result{Accepted: true}, nil
+}
+
+// Enqueue 将一条记录放入有界队列。
+//   - DropNewest：满时丢弃本条，DroppedNew +1；
+//   - DropOldest：满时丢弃队首旧条，DroppedOld +1，本条入队；
+//   - BlockCaller：阻塞直到有空位；Shutdown 时返回 ErrClosed。
+func (e *Exporter) Enqueue(ctx context.Context, r Record) error {
+	_, err := e.Submit(ctx, r)
+	return err
 }
 
 // waitLocked 必须在持有 e.mu 时调用；它阻塞直到队列有空位、

@@ -70,6 +70,7 @@ type spanImpl struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	parent   Span
+	attached []func(SpanRecord)
 }
 
 func (s *spanImpl) Context() context.Context     { return s.ctx }
@@ -91,6 +92,17 @@ func (s *spanImpl) SetAttribute(key, value string) {
 
 func (s *spanImpl) Cancel() {
 	s.cancel()
+}
+
+// attachEndObserver 登记一个附加结束观察者；Span 已结束时为空操作，
+// 保证不会对同一成员触发两次。
+func (s *spanImpl) attachEndObserver(fn func(SpanRecord)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended {
+		return
+	}
+	s.attached = append(s.attached, fn)
 }
 
 func (s *spanImpl) Ended() bool {
@@ -121,11 +133,18 @@ func (s *spanImpl) End(reason string) {
 	}
 	rec := s.snapshotLocked()
 	cb := s.cfg.onEnd
+	attached := s.attached
+	s.attached = nil
 	s.mu.Unlock()
 
 	s.cancel()
 	if cb != nil {
 		cb(rec)
+	}
+	// 附加观察者只针对被登记的这一个 Span，且在 End 的首次生效调用
+	// 里随主回调一起触发，保证“一个成员只被汇总一次”。
+	for _, ob := range attached {
+		ob(rec)
 	}
 }
 
