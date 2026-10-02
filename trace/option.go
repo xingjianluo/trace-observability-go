@@ -1,5 +1,7 @@
 package trace
 
+import "context"
+
 // SamplingState 表示采样决策在追踪链路上的传播状态。
 type SamplingState int
 
@@ -32,7 +34,10 @@ type SpanConfig struct {
 	Attributes     map[string]string
 	FinalSampling  SamplingState
 	PresetTraceID  string
-	onEnd          func(SpanRecord)
+	onEnd          func(SpanRecord) DeliveryResult
+	// origin 是整条 Span 链真正的外部派生源 ctx（根 Span 的创建 ctx；
+	// 业务组场景即组的可取消 parent ctx），供子 Span 判定 deadline/取消来源。
+	origin context.Context
 }
 
 // SpanOption 用于在创建 Span 时修改 SpanConfig。
@@ -72,6 +77,8 @@ func WithTraceID(traceID string) SpanOption {
 }
 
 // WithOnEnd 注册 Span 结束回调（装配层用它把记录投递到导出器）。
-func WithOnEnd(fn func(SpanRecord)) SpanOption {
+// 返回值描述本次投递的下游结论，供分组观察者统计覆盖情况；
+// 直接使用 trace 包时可返回零值 DeliveryResult（按 unknown 处理）。
+func WithOnEnd(fn func(SpanRecord) DeliveryResult) SpanOption {
 	return func(c *SpanConfig) { c.onEnd = fn }
 }

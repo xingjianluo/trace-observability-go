@@ -8,6 +8,7 @@ type SpanView struct {
 	TraceID       string            `json:"trace_id"`
 	SpanID        string            `json:"span_id"`
 	ParentSpanID  string            `json:"parent_span_id"`
+	GroupSpanID   string            `json:"group_span_id,omitempty"`
 	Name          string            `json:"name"`
 	StartTime     time.Time         `json:"start_time"`
 	EndTime       time.Time         `json:"end_time"`

@@ -100,7 +100,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 场景三：制造队列积压（同步快速投递超过容量），展示丢弃计数可观测。
+	// 场景三：业务分组——一批并发操作 + 嵌套子组，收尾产出唯一组级汇总。
+	bizGrp := p.StartGroup(context.Background(), "order.fulfill")
+	bizGrp.Go("inventory.lock", func(ctx context.Context, s trace.Span) {
+		log.Info(ctx, "locking stock", map[string]any{"phone": "13900001111"})
+	})
+	ship := bizGrp.SubGroup("shipment")
+	ship.Go("carrier.book", func(ctx context.Context, s trace.Span) {
+		log.Info(ctx, "booking carrier", map[string]any{"token": "tok_ship_secret"})
+	})
+	ship.Go("label.print", func(ctx context.Context, s trace.Span) {
+		s.SetAttribute("api_key", "AKIA-DEMO-RAW")
+	})
+	shipSum := ship.Wait()
+	rootSum := bizGrp.Wait()
+	fmt.Printf("group outer: total=%d ok=%d observed=%d sampled_out=%d queue_dropped=%d\n",
+		rootSum.Coverage.Total, rootSum.SuccessCount,
+		rootSum.Coverage.Observed, rootSum.Coverage.SampledOut, rootSum.Coverage.QueueDropped)
+	fmt.Printf("group inner: total=%d parent_group=%s\n",
+		shipSum.Coverage.Total, shipSum.ParentGroup)
+
+	// 场景四：制造队列积压（同步快速投递超过容量），展示丢弃计数可观测。
 	ctx3, root3 := p.StartSpan(context.Background(), "backpressure.writer", false)
 	for i := 0; i < *capacity+50; i++ {
 		log.Debug(ctx3, "burst event", map[string]any{"i": i, "api_key": "AKIA1234567890"})
@@ -129,7 +149,7 @@ func summarize(path string) {
 		fmt.Fprintf(os.Stderr, "read output: %v\n", err)
 		return
 	}
-	var spans, logs int
+	var spans, logs, groups int
 	var reasons = map[string]int{}
 	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
 		if len(line) == 0 {
@@ -155,10 +175,12 @@ func summarize(path string) {
 					_ = json.Unmarshal(d, &v)
 					reasons[v.EndReason]++
 				}
+			case "group":
+				groups++
 			case "log":
 				logs++
 			}
 		}
 	}
-	fmt.Printf("summary: spans=%d logs=%d end_reasons=%v\n", spans, logs, reasons)
+	fmt.Printf("summary: spans=%d groups=%d logs=%d end_reasons=%v\n", spans, groups, logs, reasons)
 }

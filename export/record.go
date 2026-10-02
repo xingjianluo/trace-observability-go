@@ -8,6 +8,7 @@ type Kind int
 const (
 	KindSpan Kind = iota
 	KindLog
+	KindGroup
 )
 
 func (k Kind) String() string {
@@ -16,6 +17,8 @@ func (k Kind) String() string {
 		return "span"
 	case KindLog:
 		return "log"
+	case KindGroup:
+		return "group"
 	default:
 		return "unknown"
 	}
@@ -35,6 +38,8 @@ func (k *Kind) UnmarshalJSON(data []byte) error {
 			*k = KindSpan
 		case "log":
 			*k = KindLog
+		case "group":
+			*k = KindGroup
 		default:
 			*k = Kind(-1)
 		}

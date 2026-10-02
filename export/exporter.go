@@ -118,23 +118,64 @@ func New(w io.Writer, opts ...Option) *Exporter {
 // ErrClosed 在 Shutdown 之后再调用 Enqueue 时返回。
 var ErrClosed = errors.New("export: exporter closed")
 
-// Enqueue 将一条记录放入有界队列。
-//   - DropNewest：满时丢弃本条，DroppedNew +1；
+// EnqueueOutcome 描述一次入队尝试的结论，供上层做覆盖统计。
+type EnqueueOutcome int
+
+const (
+	// OutcomeAccepted 记录已进入有界队列。
+	OutcomeAccepted EnqueueOutcome = iota
+	// OutcomeDroppedNew 队列满（DropNewest），本条被丢弃。
+	OutcomeDroppedNew
+	// OutcomeDroppedOld 队列满（DropOldest），旧记录被丢弃、本条入队；
+	// 对本条而言仍是 accepted，旧记录的丢弃另行通过 Stats 可观测。
+	OutcomeDroppedOld
+	// OutcomeRejected 导出器已关闭，记录未被接受。
+	OutcomeRejected
+)
+
+// EnqueueResult 是 EnqueueR 的返回：是否入队、枚举结论与可读原因。
+type EnqueueResult struct {
+	Accepted bool
+	Outcome  EnqueueOutcome
+	Reason   string
+	Err      error // ctx 取消等场景下的原始错误
+}
+
+// Enqueue 将一条记录放入有界队列（向后兼容包装，错误语义保持不变）。
+//   - DropNewest：满时丢弃本条，DroppedNew +1，返回 nil；
 //   - DropOldest：满时丢弃队首旧条，DroppedOld +1，本条入队；
-//   - BlockCaller：阻塞直到有空位；Shutdown 时返回 ErrClosed。
+//   - BlockCaller：阻塞直到有空位；ctx 取消返回 ctx 错误；Shutdown 时返回 ErrClosed。
 func (e *Exporter) Enqueue(ctx context.Context, r Record) error {
+	res := e.EnqueueR(ctx, r)
+	if res.Err != nil {
+		return res.Err
+	}
+	if res.Outcome == OutcomeRejected {
+		return ErrClosed
+	}
+	return nil
+}
+
+// EnqueueR 与 Enqueue 行为一致，但额外返回结构化的入队结论，
+// 供分组汇总区分“已纳入统计”与“因队列背压没能纳入统计”的成员。
+// ctx 取消导致 BlockCaller 提前返回时，错误经返回的 error 给出，
+// Result.Outcome 为 OutcomeRejected（记录未被接受）。
+func (e *Exporter) EnqueueR(ctx context.Context, r Record) EnqueueResult {
 	e.mu.Lock()
 	for len(e.queue) >= e.capacity && !e.closed {
 		if e.policy == BlockCaller {
 			if err := ctx.Err(); err != nil {
 				e.mu.Unlock()
-				return err
+				return EnqueueResult{Outcome: OutcomeRejected, Reason: err.Error(), Err: err}
 			}
 			// cond.Wait 期间释放锁；用 watcher 在 ctx 取消或 stop 时唤醒。
 			// e.waitLocked 返回后 watcher 一定会退出，不会泄漏协程。
 			if err := e.waitLocked(ctx); err != nil {
 				e.mu.Unlock()
-				return err
+				if e.isClosed() {
+					return EnqueueResult{Outcome: OutcomeRejected, Reason: "exporter closed", Err: ErrClosed}
+				}
+				return EnqueueResult{Outcome: OutcomeRejected, Reason: err.Error(), Err: err}
 			}
 			continue
 		}
@@ -145,17 +186,17 @@ func (e *Exporter) Enqueue(ctx context.Context, r Record) error {
 		}
 		e.stats.DroppedNew++
 		e.mu.Unlock()
-		return nil
+		return EnqueueResult{Outcome: OutcomeDroppedNew, Reason: "queue full: drop newest"}
 	}
 	if e.closed {
 		e.mu.Unlock()
-		return ErrClosed
+		return EnqueueResult{Outcome: OutcomeRejected, Reason: "exporter closed"}
 	}
 	e.queue = append(e.queue, r)
 	e.stats.Enqueued++
 	e.mu.Unlock()
 	e.cond.Signal()
-	return nil
+	return EnqueueResult{Accepted: true, Outcome: OutcomeAccepted, Reason: "enqueued"}
 }
 
 // waitLocked 必须在持有 e.mu 时调用；它阻塞直到队列有空位、
@@ -190,6 +231,13 @@ func (e *Exporter) Snapshot() Stats {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.stats
+}
+
+// isClosed 返回导出器是否已关闭（内部辅助，调用方自行持锁/加锁）。
+func (e *Exporter) isClosed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.closed
 }
 
 func (e *Exporter) takeBatchLocked(max int) []Record {

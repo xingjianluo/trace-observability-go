@@ -105,6 +105,19 @@ func (m *Masker) MaskFields(fields map[string]any) map[string]any {
 	return out
 }
 
+// MaskStringMap 复制并脱敏 map[string]string（如组汇总属性）中的敏感字段，
+// 原始 map 不会被修改；只有命中脱敏规则的字段才会被打码。
+func (m *Masker) MaskStringMap(fields map[string]string) map[string]string {
+	if fields == nil {
+		return nil
+	}
+	out := make(map[string]string, len(fields))
+	for k, v := range fields {
+		out[k] = m.maskString(strings.ToLower(k), v)
+	}
+	return out
+}
+
 func (m *Masker) maskValue(field string, v any) any {
 	lk := strings.ToLower(field)
 	switch val := v.(type) {

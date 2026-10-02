@@ -35,6 +35,7 @@ type Pipeline struct {
 	exporter *export.Exporter
 	logger   *logging.Logger
 	sampler  *sampling.ThresholdSampler
+	masker   *logging.Masker
 }
 
 // NewPipeline 根据配置装配管线并启动导出协程。
@@ -73,7 +74,7 @@ func NewPipeline(cfg Config) (*Pipeline, error) {
 	if cfg.MaskRules != nil {
 		masker = logging.NewMasker(cfg.MaskRules)
 	}
-	p := &Pipeline{exporter: ex, sampler: s}
+	p := &Pipeline{exporter: ex, sampler: s, masker: masker}
 	p.logger = logging.NewLogger(p, masker)
 	return p, nil
 }
@@ -105,26 +106,36 @@ func (p *Pipeline) StartSpan(ctx context.Context, name string, forced bool, opts
 		opts = append(opts, trace.WithTraceID(tid))
 	}
 	opts = append(opts, trace.WithFinalSampling(state), trace.WithOnEnd(p.onSpanEnd))
-
 	c, s := trace.StartSpan(ctx, name, opts...)
 	s.SetAttribute("sampling.decision_reason", reason)
 	return c, s
 }
 
-// onSpanEnd 是 Span 结束回调：仅把被采样（Accept）的 Span 投递到有界队列。
-func (p *Pipeline) onSpanEnd(rec trace.SpanRecord) {
+// onSpanEnd 是 Span 结束回调：仅把被采样（Accept）的 Span 投递到有界队列，
+// 并把下游投递结论返回给 trace 层（分组观察者据此统计覆盖情况）。
+func (p *Pipeline) onSpanEnd(rec trace.SpanRecord) trace.DeliveryResult {
 	if rec.SamplingState != trace.SamplingAccept {
-		return
+		return trace.DeliveryResult{
+			Outcome: trace.DeliveryOutcomeNotSampled,
+			Reason:  "trace sampled out: member detail not exported",
+		}
+	}
+	// Span 属性在入队前同样要脱敏：SetAttribute 可能写入敏感内容
+	// （如组属性透传、业务标注），保证导出中不残留原始敏感值。
+	attrs := rec.Attributes
+	if p.masker != nil && len(attrs) > 0 {
+		attrs = p.masker.MaskStringMap(attrs)
 	}
 	v := export.SpanView{
 		TraceID:       rec.TraceID,
 		SpanID:        rec.SpanID,
 		ParentSpanID:  rec.ParentSpanID,
+		GroupSpanID:   rec.Attributes["group_span_id"],
 		Name:          rec.Name,
 		StartTime:     rec.StartTime,
 		EndTime:       rec.EndTime,
 		DurationNanos: rec.EndTime.Sub(rec.StartTime).Nanoseconds(),
-		Attributes:    rec.Attributes,
+		Attributes:    attrs,
 		Status:        rec.Status,
 		EndReason:     rec.EndReason,
 		Depth:         rec.Depth,
@@ -133,15 +144,25 @@ func (p *Pipeline) onSpanEnd(rec trace.SpanRecord) {
 	}
 	data, err := json.Marshal(v)
 	if err != nil {
-		return
+		return trace.DeliveryResult{Outcome: trace.DeliveryOutcomeUnknown, Reason: err.Error()}
 	}
-	_ = p.exporter.Enqueue(context.Background(), export.Record{
+	res := p.exporter.EnqueueR(context.Background(), export.Record{
 		Kind:     export.KindSpan,
 		Data:     data,
 		TraceID:  rec.TraceID,
 		SpanID:   rec.SpanID,
 		Accepted: true,
 	})
+	switch res.Outcome {
+	case export.OutcomeAccepted:
+		return trace.DeliveryResult{Outcome: trace.DeliveryOutcomeAccepted, Reason: res.Reason}
+	case export.OutcomeDroppedNew:
+		return trace.DeliveryResult{Outcome: trace.DeliveryOutcomeDroppedQueue, Reason: res.Reason}
+	case export.OutcomeRejected:
+		return trace.DeliveryResult{Outcome: trace.DeliveryOutcomeClosed, Reason: res.Reason}
+	default:
+		return trace.DeliveryResult{Outcome: trace.DeliveryOutcomeUnknown, Reason: res.Reason}
+	}
 }
 
 // OnLog 实现 logging.Sink：把脱敏后的日志条目投递到有界队列。

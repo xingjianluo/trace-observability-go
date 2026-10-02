@@ -19,16 +19,23 @@
 - **有界队列 + 批次导出**：容量有界，三种背压策略（丢新 / 丢旧 / 阻塞调用方）；
   `enqueued / dropped_new / dropped_old / exported / batches` 计数全部可观测；
   正常 `Shutdown` 时排空队列，**已接受数据不丢失**。
+- **业务分组与嵌套汇总（`group` 包）**：把一批并发操作（可继续嵌套子组、
+  成员可来自不同协程/层级）当成整体管理停止与收尾。支持外部取消、中间层
+  停止、成员自身停止三向停止传播；默认失败隔离，可选 `WithFailFast()`
+  “一个失败整体停”。每个组结束产出**恰好一条**组级汇总：成员总数、结果
+  分布、是否被提前停及原因、耗时，以及“实际统计到 / 未采样 / 队列积压丢弃”
+  的覆盖拆分；汇总与成员明细靠 `trace_id` + `group_span_id` 对齐。
 
 ## 包结构
 
 | 包 | 职责 |
 |----|------|
-| `trace`    | Span、`context.Context` 传播、`Group` 并发派生、注入/提取（Carrier）、ID 源 |
+| `trace`    | Span、`context.Context` 传播、`Group` 并发派生、注入/提取（Carrier）、ID 源、Span 生命周期观察者 |
+| `group`    | 业务组：可嵌套并发组、三向停止传播、失败策略、组级汇总与覆盖统计 |
 | `sampling` | 确定性阈值采样器与可解释的 `Decision` |
 | `logging`  | 关联追踪的结构化日志器、脱敏 `Masker` |
-| `export`   | 有界队列、批次 JSON Lines 写出、背压策略与计数 |
-| `obs`      | 把上述组件装配为 `Pipeline` |
+| `export`   | 有界队列、批次 JSON Lines 写出、背压策略与计数、Span/Group 视图 |
+| `obs`      | 把上述组件装配为 `Pipeline`（含 `StartGroup`） |
 | `cmd/demo` | 本地端到端示例 |
 
 ## 快速开始
@@ -57,6 +64,15 @@ g.Go("payment.charge", func(ctx context.Context, s trace.Span) {
 })
 g.Wait()
 root.End(trace.ReasonCompleted)
+
+// 业务分组：一批并发操作 + 嵌套子组，收尾得到唯一组级汇总。
+g2 := p.StartGroup(ctx, "order.fulfill")
+g2.Go("reserve", func(ctx context.Context, s trace.Span) { /* ... */ })
+sub := g2.SubGroup("shipment") // 或 group.WithFailFast() 开启一个失败整体停
+sub.Go("carrier", func(ctx context.Context, s trace.Span) { /* ... */ })
+sub.Wait()
+summary := g2.Wait()            // group.Summary：成员分布/停止原因/coverage
+_ = summary.Coverage.Observed   // 实际纳入统计的成员数
 ```
 
 运行示例：
@@ -97,6 +113,103 @@ go run ./cmd/demo -out /tmp/demo.jsonl -rate 1.0 -capacity 256
 7. **ID 可复现**。默认 `CounterIDSource` 用进程内单调计数器生成 16 位
    十六进制定长 ID；测试可 `trace.SetIDSource(trace.NewCounterIDSource())`
    重置序列，使输出逐条可比对。
+
+## 业务分组与嵌套汇总
+
+`group.Group` 在 Span 之上提供“业务组”语义：一次业务处理拆成多个阶段，
+每个阶段还能派生自己的并发动作甚至子组，收尾时按组给出一条整体结论，
+而不用手工拼一堆散落片段。
+
+```go
+g := p.StartGroup(ctx, "order.fulfill") // 返回的 *group.Group
+g.Go("reserve", func(ctx context.Context, s trace.Span) { ... })
+
+sub := g.SubGroup("shipment")           // 嵌套子组
+sub.Go("call.carrier", func(ctx context.Context, s trace.Span) { ... })
+summary := sub.Wait()                   // 子组先收尾
+summary = g.Wait()                      // 父组收尾，产出唯一汇总
+```
+
+### 归属与嵌套
+
+- **每个组拥有自己的组 Span**。成员（`g.Go` 的协程，以及成员 fn 内直接
+  `StartSpan` 的后代 Span）都是该组的**直接成员**；成员内部再嵌套的
+  `g.SubGroup` 则是一个独立组——它自己的组 Span 作为父组的一个直接成员，
+  它的内部成员归它自己统计，不重复计入父组。
+- 成员与组靠 `trace_id` 和 `group_span_id` 对齐：每个成员 Span/汇总都带
+  最近组的 `group_span_id`，子组汇总带 `parent_group_span_id`。
+  **不会出现找不到归属的成员，也不会把同一成员重复计入两个组。**
+- 成员可以由不同协程、不同层级派生；`Go` 在调用方协程同步预占“协程槽”，
+  槽位直到 fn 返回（内部 Span 都已结束）才释放，因此 `Wait` 不会在
+  “成员 Span 已结束、内部 Span 尚未启动”的窗口里提前归零。
+
+### 停止传播与异常
+
+停止信号有三个来源，成员都会及时收到并各自记下**唯一且一致**的原因：
+
+| 来源 | 组/成员的记录 |
+|------|---------------|
+| 最外层父 context 取消 / 超时 | 汇总 `stopped=true, stop_reason=external_cancel`；成员 `parent_canceled` / `deadline_exceeded` |
+| 中间层（某组）`g.Stop()` | 该组及尚未结束的下游收到信号，成员记 `parent_canceled`；停止原因记 `stopped` |
+| 组内成员自己的调用方 `s.Cancel()` | 仅该成员记 `canceled`，组整体不算被停，其他成员不受影响 |
+
+- 终止原因用 `context.Cause` 沿取消链追溯，并以“最外层派生源 ctx”为权威
+  （业务组把它显式注入，组自身的 `Stop` 取消不会污染该源），因此
+  **停止与超时几乎同时发生时不会前后给出矛盾结论**：外部超时稳定判为
+  `deadline_exceeded` + `external_cancel`。
+- 成员 Span 的 `End` 幂等：并发结束、重复结束、panic 兜底结束都只有第一次
+  结论生效，一个成员**不可能既算正常完成又算被停**。
+- fn 内 panic 会被捕获（写入 `panic` / `panic.stack` 属性），该成员以
+  `error` 结束并标记 `panic=true`，不会崩溃整个进程。
+
+### 失败策略
+
+- **默认失败隔离**：一个成员 `error`/panic 不影响其他成员，失败只体现在
+  汇总的 `error_count` 与 `outcome_counts` 里，组整体 `stopped=false`。
+- **FailFast**：`group.New(..., group.WithFailFast())`（或 `StartGroup`
+  传入该 option）时，第一个 `error`/panic 成员立即取消全组，其余未结束
+  成员记 `parent_canceled`，汇总 `stop_reason=fail_fast_member_error`。
+
+### 组级汇总（恰好一条）
+
+`Wait()`/`Close()` 返回 `group.Summary`，并通过 emitter（接管线时即导出
+一条 `"group"` 记录）**恰好触发一次**——成员并发结束、重复 `Wait` 都不会
+产生第二条。字段包括：
+
+- `total` / `members`：直接成员数量与明细（按组内登记序 `start_seq` 排列，
+  输出可复现），每个 span_id 只出现一次；
+- `outcome_counts`、`success_count`、`error_count`、`canceled_count`：
+  结果分布；
+- `stopped`、`stop_reason`、`group_status`、`end_reason`：整体是否被提前停、
+  因何而停、组 Span 的状态与终止原因；
+- `duration_nanos`：组整体耗时；
+- `coverage`：覆盖统计（见下）。
+
+### 覆盖范围如何受采样与背压影响
+
+汇总**不默认所有成员的明细都已落盘**。`coverage` 明确区分：
+
+| 字段 | 含义 |
+|------|------|
+| `total` | 直接成员总数（与采样/队列无关，成员一个不漏地计数） |
+| `observed` | 明细被下游实际**接受（入队）**的成员数 |
+| `sampled_out` | 所在链路未被采样（rate=0 等），明细不会导出 |
+| `queue_dropped` | 采样命中但有界队列积压（DropNewest/DropOldest）没能入队 |
+| `closed` | 下游已关闭（如收尾之后）导致明细未被接受 |
+| `unknown` | 未装配管线（直接用 trace/group 包）、没有投递结论 |
+
+恒有 `observed + sampled_out + queue_dropped + closed + unknown == total`。
+
+- **采样**：子 Span 继承根链路结论，整条 drop 链路既不导出成员 Span，
+  也不导出组汇总（`Summary` 仍在内存中返回，`sampled_out` 照样可查）。
+- **背压**：全采样 + 队列满时，没入队的成员明细计入 `queue_dropped`，
+  丢弃原因可由导出器 `Snapshot()` 的 `dropped_new/dropped_old` 交叉核对。
+- **收尾**：`Shutdown` 排空队列，已经入队的汇总与成员明细都不丢。
+- **脱敏**：组属性（`g.SetAttribute`）与成员 Span 属性在入队前都按同一套
+  `MaskRules` 脱敏（字符串 map 走 `MaskStringMap`），汇总不会因为带了
+  成员属性而泄露原始敏感值。
+- **可复现**：配合确定性 `CounterIDSource`，相同输入重复跑得到一致的
+  ID、成员顺序、结果分布与覆盖结论。
 
 ## 采样策略
 
@@ -174,13 +287,20 @@ go run ./cmd/demo -out /tmp/demo.jsonl
 
 - `trace`：层级归属、并发 64 子 Span 归属与计数、父取消传播为
   `parent_canceled`、子取消不波及父、超时原因、End 幂等、注入/提取往返。
+- `group`：嵌套组归属（子组组 Span 是父组直接成员、trace/父子组 id 对齐）、
+  扇出过程中整体停（外部取消/显式 Stop/成员自停三向原因）、FailFast 与
+  默认失败隔离、panic 成员计 error 且只计一次、成员并发结束 + 汇总恰好一条、
+  停止与超时竞态下结论稳定一致。
 - `sampling`：同键结论稳定、rate=0/1 边界、forced、近似比率分布、盐、并发安全。
 - `logging`：关联字段、脱敏后无原始值残留（含嵌套）、原 map 不被修改、
   32 协程并发日志不串号、drop 链路不产生日志。
 - `export`：三种背压策略、丢弃计数与守恒、阻塞可被 Flush/cancel 解除、
   Shutdown 后入队报错、500 条收尾零丢失、并发入队竞态。
 - 根目录集成测试：端到端并发归属、父取消、采样稳定可解释、队列积压丢弃
-  可观测、收尾完整、混合负载脱敏。
+  可观测、收尾完整、混合负载脱敏，以及分组专项——
+  嵌套组 + 汇总仅一条、扇出被整体停、成员并发结束不重复、
+  低采样叠加队列积压的 `coverage` 拆分（sampled_out / queue_dropped）、
+  组汇总与成员属性脱敏、相同输入可复现。
 
 所有失败断言都会打印**输入、实际结果、期望值与判定依据**，便于复盘。
 

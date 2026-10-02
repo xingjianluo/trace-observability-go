@@ -16,14 +16,18 @@ import (
 )
 
 type decoded struct {
-	spans map[string]export.SpanView
-	logs  []logging.Entry
-	raw   string
+	spans  map[string]export.SpanView
+	logs   []logging.Entry
+	groups map[string]export.GroupView
+	raw    string
 }
 
 func decodeOutput(t *testing.T, data []byte) decoded {
 	t.Helper()
-	d := decoded{spans: map[string]export.SpanView{}}
+	d := decoded{
+		spans:  map[string]export.SpanView{},
+		groups: map[string]export.GroupView{},
+	}
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		if line == "" {
 			continue
@@ -43,6 +47,12 @@ func decodeOutput(t *testing.T, data []byte) decoded {
 					t.Fatalf("span JSON 解析失败: %v", err)
 				}
 				d.spans[v.SpanID] = v
+			case "group":
+				var v export.GroupView
+				if err := json.Unmarshal(rec.Data, &v); err != nil {
+					t.Fatalf("group JSON 解析失败: %v", err)
+				}
+				d.groups[v.GroupSpanID] = v
 			case "log":
 				var e logging.Entry
 				if err := json.Unmarshal(rec.Data, &e); err != nil {

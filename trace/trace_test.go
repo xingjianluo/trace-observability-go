@@ -41,7 +41,7 @@ func TestStartSpanHierarchy(t *testing.T) {
 func TestSpanEndIsIdempotent(t *testing.T) {
 	SetIDSource(NewCounterIDSource())
 	var ends atomic.Int32
-	ctx, s := StartSpan(context.Background(), "s", WithOnEnd(func(SpanRecord) { ends.Add(1) }))
+	ctx, s := StartSpan(context.Background(), "s", WithOnEnd(func(SpanRecord) DeliveryResult { ends.Add(1); return DeliveryResult{} }))
 	_ = ctx
 	s.End("")
 	s.End("")
@@ -59,7 +59,12 @@ func TestGroupConcurrentChildrenAttribution(t *testing.T) {
 	var mu sync.Mutex
 
 	ctx, root := StartSpan(context.Background(), "root",
-		WithOnEnd(func(r SpanRecord) { mu.Lock(); records = append(records, r); mu.Unlock() }))
+		WithOnEnd(func(r SpanRecord) DeliveryResult {
+			mu.Lock()
+			records = append(records, r)
+			mu.Unlock()
+			return DeliveryResult{}
+		}))
 	g := NewGroup(ctx)
 	for i := 0; i < n; i++ {
 		g.Go("child", func(ctx context.Context, s Span) {
@@ -95,10 +100,11 @@ func TestGroupParentCancellation(t *testing.T) {
 
 	pctx, cancel := context.WithCancel(context.Background())
 	ctx, root := StartSpan(pctx, "root",
-		WithOnEnd(func(r SpanRecord) {
+		WithOnEnd(func(r SpanRecord) DeliveryResult {
 			mu.Lock()
 			reasons = append(reasons, r.Name+":"+r.EndReason)
 			mu.Unlock()
+			return DeliveryResult{}
 		}))
 	g := NewGroup(ctx)
 	g.Go("blocked-child", func(ctx context.Context, s Span) {
