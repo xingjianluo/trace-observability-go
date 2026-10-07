@@ -182,3 +182,152 @@ func TestParentCancelPropagatesToNestedGroups(t *testing.T) {
 		failCheck(t, "inner group reason", "parent group ctx canceled", subSum.StopReason, trace.ReasonParentCanceled)
 	}
 }
+
+// noReceiptSink 模拟“认领后仍拿不到回执”的装配层
+// （例如 Span 在 Expect 之前就已结束、投递结论先于认领出现）。
+type noReceiptSink struct{}
+
+func (noReceiptSink) Expect(string) {}
+func (noReceiptSink) TakeDelivery(string) (group.Delivery, bool) {
+	return group.Delivery{}, false
+}
+
+// 覆盖：成员并发结束、重复结束、panic、显式 error 时，
+// 组级汇总必须恰好产出一次，且每个成员只被统计一次。
+func TestSummaryExactlyOnceWithConcurrentAndDuplicateEnds(t *testing.T) {
+	sink := newManualSink()
+	sum := &discardSink{}
+	g := group.New(newCtx(sink, sum), group.WithName("once"))
+
+	const workers = 64
+	for i := 0; i < workers; i++ {
+		g.Go("worker", func(ctx context.Context, s trace.Span) {
+			if i%3 == 0 {
+				// 重复结束：只有第一次生效，不得重复计入、不得改判。
+				s.End("")
+				s.End(trace.ReasonError)
+			}
+		})
+	}
+	g.Go("panicker", func(ctx context.Context, s trace.Span) { panic("boom") })
+	g.Go("self-error", func(ctx context.Context, s trace.Span) { s.End(trace.ReasonError) })
+
+	// 两个协程并发 Wait：汇总仍只产出一次，且两次拿到同一份结论。
+	var wg sync.WaitGroup
+	var s1, s2 group.Summary
+	wg.Add(2)
+	go func() { defer wg.Done(); s1 = g.Wait() }()
+	go func() { defer wg.Done(); s2 = g.Wait() }()
+	wg.Wait()
+
+	if sum.n.Load() != 1 {
+		failCheck(t, "summary delivered exactly once", "concurrent Wait x2 + 66 members",
+			sum.n.Load(), 1)
+	}
+	const total = workers + 2
+	if s1.MembersTotal != total || s2.MembersTotal != total {
+		failCheck(t, "member total", "64 workers + panicker + self-error",
+			[]int{s1.MembersTotal, s2.MembersTotal}, total)
+	}
+	if len(s1.Members) != total || len(s1.MemberSpanIDs) != total {
+		failCheck(t, "no duplicate members", total,
+			[]int{len(s1.Members), len(s1.MemberSpanIDs)}, total)
+	}
+	// panic 与显式 error 各 1 个；重复结束的第二次 error 不得生效。
+	if s1.StatusCounts["error"] != 2 {
+		failCheck(t, "error members counted once", "1 panic + 1 explicit error + duplicate End",
+			s1.StatusCounts["error"], 2)
+	}
+	if s1.StatusCounts["ok"] != total-2 {
+		failCheck(t, "ok members", "remaining workers",
+			s1.StatusCounts["ok"], total-2)
+	}
+	// 每个成员明细都能按 ID 对上号，且无重复、无遗漏。
+	seen := map[string]bool{}
+	for _, id := range s1.MemberSpanIDs {
+		if seen[id] {
+			t.Errorf("成员重复计入: %s", id)
+		}
+		seen[id] = true
+		if _, ok := s1.Members[id]; !ok {
+			t.Errorf("成员 %s 在 Members 中找不到归属", id)
+		}
+	}
+}
+
+// 覆盖：低采样 / 队列积压时，组级汇总必须分清“实际纳入”与
+// “未能纳入”的成员，并按 ID 给出每个未纳入成员的具体原因。
+func TestCoverageStatsDistinguishMissingReasons(t *testing.T) {
+	sink := newManualSink()
+	sum := &discardSink{}
+	g := group.New(newCtx(sink, sum), group.WithName("coverage"))
+
+	// 用 Track 登记手工创建的 Span，便于在结束前指定投递结论。
+	mk := func(name string) trace.Span {
+		_, s := trace.StartSpan(g.Context(), name)
+		g.Track(s)
+		return s
+	}
+	ok1 := mk("ok-1")
+	ok2 := mk("ok-2")
+	droppedNew := mk("dropped-new")
+	sampledOut := mk("sampled-out")
+
+	sink.fail(droppedNew.SpanID(), group.Delivery{Accepted: false, MissingReason: group.MissingQueueDroppedNew})
+	sink.fail(sampledOut.SpanID(), group.Delivery{Accepted: false, MissingReason: group.MissingSampledOut})
+
+	ok1.End("")
+	droppedNew.End("")
+	ok2.End("")
+	sampledOut.End("")
+
+	res := g.Wait()
+	if res.MembersTotal != 4 {
+		failCheck(t, "member total", "2 ok + 1 queue-dropped + 1 sampled-out",
+			res.MembersTotal, 4)
+	}
+	if res.MissingCount != 2 {
+		failCheck(t, "missing count", "2 of 4 not delivered", res.MissingCount, 2)
+	}
+	if res.MissingReasons[group.MissingQueueDroppedNew] != 1 {
+		failCheck(t, "queue_dropped_new reason", "queue full on one member",
+			res.MissingReasons[group.MissingQueueDroppedNew], 1)
+	}
+	if res.MissingReasons[group.MissingSampledOut] != 1 {
+		failCheck(t, "sampled_out reason", "trace not sampled on one member",
+			res.MissingReasons[group.MissingSampledOut], 1)
+	}
+	// 每个未纳入成员都能按 ID 查到具体原因；已纳入成员原因为空。
+	if mr := res.Members[droppedNew.SpanID()]; mr.MissingReason != group.MissingQueueDroppedNew {
+		failCheck(t, "per-member missing reason (queue)", droppedNew.SpanID(),
+			mr.MissingReason, group.MissingQueueDroppedNew)
+	}
+	if mr := res.Members[sampledOut.SpanID()]; mr.MissingReason != group.MissingSampledOut {
+		failCheck(t, "per-member missing reason (sampling)", sampledOut.SpanID(),
+			mr.MissingReason, group.MissingSampledOut)
+	}
+	if mr := res.Members[ok1.SpanID()]; mr.MissingReason != "" {
+		failCheck(t, "delivered member has no missing reason", ok1.SpanID(),
+			mr.MissingReason, "")
+	}
+}
+
+// 覆盖：装配层拿不出投递回执时（如登记前 Span 已结束），
+// 未采样链路的成员必须按 sampled_out 如实记账，不能静默算作已纳入。
+func TestMissingReceiptFallsBackToSamplingState(t *testing.T) {
+	sum := &discardSink{}
+	trace.SetIDSource(trace.NewCounterIDSource())
+	ctx := group.ContextWithSinks(context.Background(), noReceiptSink{}, sum)
+	g := group.New(ctx, group.WithName("fallback"))
+
+	_, s := trace.StartSpan(g.Context(), "unsampled", trace.WithFinalSampling(trace.SamplingDrop))
+	g.Track(s)
+	s.End("")
+
+	res := g.Wait()
+	if res.MissingCount != 1 || res.MissingReasons[group.MissingSampledOut] != 1 {
+		failCheck(t, "sampled_out fallback without receipt",
+			"member on dropped trace, no delivery receipt",
+			[]any{res.MissingCount, res.MissingReasons}, "1 x sampled_out")
+	}
+}

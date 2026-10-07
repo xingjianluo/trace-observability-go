@@ -184,6 +184,32 @@ func (e *Exporter) Enqueue(ctx context.Context, r Record) error {
 	return err
 }
 
+// SubmitReliable 不受 DropPolicy 影响地阻塞投递：队列满时等待空位，
+// 而不是按策略丢弃。用于组级汇总这类“丢了就无法对账”的控制类记录。
+// ctx 取消返回 ctx 错误；Shutdown 之后返回 ErrClosed。
+func (e *Exporter) SubmitReliable(ctx context.Context, r Record) error {
+	e.mu.Lock()
+	for len(e.queue) >= e.capacity && !e.closed {
+		if err := ctx.Err(); err != nil {
+			e.mu.Unlock()
+			return err
+		}
+		if err := e.waitLocked(ctx); err != nil {
+			e.mu.Unlock()
+			return err
+		}
+	}
+	if e.closed {
+		e.mu.Unlock()
+		return ErrClosed
+	}
+	e.queue = append(e.queue, r)
+	e.stats.Enqueued++
+	e.mu.Unlock()
+	e.cond.Signal()
+	return nil
+}
+
 // waitLocked 必须在持有 e.mu 时调用；它阻塞直到队列有空位、
 // ctx 取消或导出器关闭。watcher 协程在三种情况下都会被回收。
 func (e *Exporter) waitLocked(ctx context.Context) error {
@@ -270,6 +296,7 @@ func (e *Exporter) worker() {
 				e.mu.Lock()
 				e.stats.Exported += uint64(len(batch))
 				e.stats.Batches++
+				e.cond.Signal() // 腾出空位，唤醒阻塞中的生产者
 				e.mu.Unlock()
 			}
 			timer.Reset(e.interval)

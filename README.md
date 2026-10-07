@@ -19,16 +19,22 @@
 - **有界队列 + 批次导出**：容量有界，三种背压策略（丢新 / 丢旧 / 阻塞调用方）；
   `enqueued / dropped_new / dropped_old / exported / batches` 计数全部可观测；
   正常 `Shutdown` 时排空队列，**已接受数据不丢失**。
+- **业务分组（`group` 包）**：把一批并发动作（可再嵌套子组）当作一个整体。
+  每个组收尾时产出**且仅产出一条**组级汇总：成员总数、结果分布、
+  是否被提前停掉、整体耗时，以及逐成员的对账明细；采样丢弃与队列积压
+  丢失的成员按原因（`sampled_out` / `queue_dropped_new` / …）分开记账；
+  组级属性导出前按同一套规则脱敏。
 
 ## 包结构
 
 | 包 | 职责 |
 |----|------|
 | `trace`    | Span、`context.Context` 传播、`Group` 并发派生、注入/提取（Carrier）、ID 源 |
+| `group`    | 业务分组：并发成员归组、嵌套子组、停止传播、恰好一次的组级汇总与覆盖统计 |
 | `sampling` | 确定性阈值采样器与可解释的 `Decision` |
 | `logging`  | 关联追踪的结构化日志器、脱敏 `Masker` |
-| `export`   | 有界队列、批次 JSON Lines 写出、背压策略与计数 |
-| `obs`      | 把上述组件装配为 `Pipeline` |
+| `export`   | 有界队列、批次 JSON Lines 写出、背压策略与计数、组级汇总视图 |
+| `obs`      | 把上述组件装配为 `Pipeline`（含业务组的投递回执与汇总导出） |
 | `cmd/demo` | 本地端到端示例 |
 
 ## 快速开始
@@ -66,7 +72,7 @@ go run ./cmd/demo -out /tmp/demo.jsonl -rate 1.0 -capacity 256
 ```
 
 输出为 **JSON Lines**：每行是一个批次（JSON 数组），数组元素形如
-`{"kind":"span|log","data":{...},"trace_id":...,"span_id":...,"accepted":true}`。
+`{"kind":"span|log|group_summary","data":{...},"trace_id":...,"span_id":...,"accepted":true}`。
 
 ## 上下文传播与生命周期语义
 
@@ -97,6 +103,69 @@ go run ./cmd/demo -out /tmp/demo.jsonl -rate 1.0 -capacity 256
 7. **ID 可复现**。默认 `CounterIDSource` 用进程内单调计数器生成 16 位
    十六进制定长 ID；测试可 `trace.SetIDSource(trace.NewCounterIDSource())`
    重置序列，使输出逐条可比对。
+
+## 业务分组（group）
+
+`group` 包把一批并发动作当作一个业务整体：跑完一个组就产出**一条、且只有
+一条**组级结果（`group_summary` 记录），从里面能直接看出成员总数、结果分布、
+是否被提前停掉、整体耗时，并能与每个成员的导出明细逐条对上号。
+
+```go
+ctx, root := p.StartSpan(context.Background(), "nightly.batch", false)
+g := group.New(ctx, group.WithName("nightly-batch"), group.WithAttribute("token", "..."))
+for i := 0; i < 3; i++ {
+    g.Go("etl.task", func(ctx context.Context, s trace.Span) { /* ... */ })
+}
+// 成员回调里再派生一批动作、用子组包起来（嵌套分组）：
+g.Go("etl.spawn", func(ctx context.Context, s trace.Span) {
+    sub := group.New(ctx).Sub(group.WithName("sub-batch"))
+    sub.Go("etl.subtask", func(ctx context.Context, s trace.Span) {})
+    sub.Wait()
+})
+sum := g.Wait() // 恰好一条组级汇总；重复 Wait 幂等，不会重复产出
+root.End("")
+```
+
+**分组与嵌套语义**：
+
+- `group.New(ctx)` 是“当前组”的获取入口：ctx 中已有业务组时返回它
+  （不会造出无人收尾的孤儿组），否则创建一个新的根组。
+  要显式创建嵌套子组用 `Sub()`（或 `group.New(ctx).Sub()`）。
+- 子组的组 Span 自动登记为父组的**直接成员**，父组会等它收尾；
+  成员回调里派生的子组同样归到外层组——`Group.Go` 会把“当前组”绑定
+  与装配层回执接口重新注入成员 ctx，不管成员来自哪个层级、哪个协程
+  派生，都不会漏记。
+- 每个成员**恰好统计一次**：并发结束、重复 `End`、panic（转为 `error`
+  结束并记录 `panic` / `panic.stack` 属性）、被取消，都不会重复计入；
+  汇总里的 `members` 按登记顺序给出每个成员的 `span_id / status /
+  end_reason / missing_reason`，与成员 Span 明细一一对应。
+
+**停止与异常**：
+
+- `g.Stop()`（或 `WithFailFast()` 下任一成员 error，或外层 ctx 取消/
+  超时）会立即取消组上下文；停止请求无论从最外层、中间层还是成员
+  自己的调用方发起，未结束的成员都会同步收到信号，并各自记下自己的
+  停止原因（`parent_canceled` / `deadline_exceeded` / …）。
+- 组级结果上 `stopped_early=true` 且 `stop_reason` 给出整体原因
+  （`fail_fast` / `deadline_exceeded` / `parent_canceled` / `canceled`）；
+  正常完成为 `completed`、`stopped_early=false`。
+
+**覆盖统计（采样与背压的影响）**：
+
+- 组级结果分清“实际纳入导出的成员”与“没能纳入的成员”：
+  `missing_count` 与 `missing_reasons` 按原因汇总
+  （`sampled_out`=链路未被采样、`queue_dropped_new`=队列积压被丢弃、
+  `exporter_closed`=导出器已关闭），每个成员的 `missing_reason`
+  字段给出各自的具体原因。
+- 组级汇总**不随采样丢弃**：即使整条链路未被采样（成员明细不导出），
+  汇总也会导出，否则采样丢弃的量无处对账；汇总的 `sampling_state`
+  字段会标记链路采样结论。
+- 组级汇总经 `SubmitReliable` **可靠投递**：队列积压时阻塞等待空位，
+  而不是按丢弃策略被丢掉（否则覆盖统计本身会丢失）。成员明细仍走
+  正常的背压策略，被丢的成员由汇总里的覆盖统计对冲。
+- 正常 `Shutdown` 时汇总与成员明细一起被排空，已产出的数据不丢失。
+- 组级自定义属性（`WithAttribute` / `SetAttribute`）在导出前由装配层
+  按 `MaskRules` 脱敏，原始敏感值不会进入导出数据。
 
 ## 采样策略
 
@@ -166,21 +235,29 @@ go test ./... -race -count=10
 # 静态检查
 go vet ./...
 
-# 端到端示例（含并发归属、父取消、队列积压丢弃、脱敏、收尾不丢）
+# 端到端示例（含并发归属、父取消、业务分组与嵌套子组、队列积压丢弃、脱敏、收尾不丢）
 go run ./cmd/demo -out /tmp/demo.jsonl
+# 查看组级结果（每组恰好一条，含成员对账与覆盖统计）
+grep -o '"kind":"group_summary"' /tmp/demo.jsonl | wc -l
 ```
 
 测试覆盖：
 
 - `trace`：层级归属、并发 64 子 Span 归属与计数、父取消传播为
   `parent_canceled`、子取消不波及父、超时原因、End 幂等、注入/提取往返。
+- `group`：嵌套组归属与等待（成员回调里再派生子组）、外部/父级停止传播、
+  成员并发结束 + 重复结束 + panic 时汇总恰好一次且成员只计一次、
+  低采样/队列积压下按原因区分的覆盖统计、无回执时按采样状态兜底记账。
 - `sampling`：同键结论稳定、rate=0/1 边界、forced、近似比率分布、盐、并发安全。
 - `logging`：关联字段、脱敏后无原始值残留（含嵌套）、原 map 不被修改、
   32 协程并发日志不串号、drop 链路不产生日志。
 - `export`：三种背压策略、丢弃计数与守恒、阻塞可被 Flush/cancel 解除、
   Shutdown 后入队报错、500 条收尾零丢失、并发入队竞态。
 - 根目录集成测试：端到端并发归属、父取消、采样稳定可解释、队列积压丢弃
-  可观测、收尾完整、混合负载脱敏。
+  可观测、收尾完整、混合负载脱敏；业务组端到端——组级结果恰好一次且与
+  成员明细逐条对账、扇出中整体停止、rate=0 时汇总仍导出并记
+  `sampled_out`、队列积压时汇总可靠投递并记 `queue_dropped_new`、
+  组级属性脱敏。
 
 所有失败断言都会打印**输入、实际结果、期望值与判定依据**，便于复盘。
 

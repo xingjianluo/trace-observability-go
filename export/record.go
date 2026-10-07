@@ -38,6 +38,8 @@ func (k *Kind) UnmarshalJSON(data []byte) error {
 			*k = KindSpan
 		case "log":
 			*k = KindLog
+		case "group_summary":
+			*k = KindGroup
 		default:
 			*k = Kind(-1)
 		}
