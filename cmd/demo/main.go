@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/xingjianluo/trace-observability-go/export"
+	"github.com/xingjianluo/trace-observability-go/group"
 	"github.com/xingjianluo/trace-observability-go/logging"
 	"github.com/xingjianluo/trace-observability-go/obs"
 	"github.com/xingjianluo/trace-observability-go/trace"
@@ -100,6 +101,35 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 场景四：业务分组——一批并发动作归入一个业务组，成员回调里再嵌套子组。
+	// 每个组收尾时恰好产出一条组级汇总（成员数、结果分布、覆盖统计），
+	// 组级属性导出前按规则脱敏。
+	ctx4, root4 := p.StartSpan(context.Background(), "nightly.batch", false)
+	bg := group.New(ctx4,
+		group.WithName("nightly-batch"),
+		group.WithAttribute("token", "batch-secret"),
+		group.WithAttribute("batch.size", 3),
+	)
+	for i := 0; i < 3; i++ {
+		bg.Go("etl.task", func(ctx context.Context, s trace.Span) {
+			log.Info(ctx, "task finished", map[string]any{"api_key": "AKIA1234567890"})
+		})
+	}
+	bg.Go("etl.spawn", func(ctx context.Context, s trace.Span) {
+		sub := group.New(ctx).Sub(group.WithName("sub-batch"))
+		sub.Go("etl.subtask", func(ctx context.Context, s trace.Span) {})
+		sub.Wait()
+	})
+	bsum := bg.Wait()
+	root4.End(trace.ReasonCompleted)
+	fmt.Printf("group summary: name=%s members=%d status=%v missing=%d stop=%s\n",
+		bsum.Name, bsum.MembersTotal, bsum.StatusCounts, bsum.MissingCount, bsum.StopReason)
+
+	if err := p.Exporter().Flush(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "flush: %v\n", err)
+		os.Exit(1)
+	}
+
 	// 场景三：制造队列积压（同步快速投递超过容量），展示丢弃计数可观测。
 	ctx3, root3 := p.StartSpan(context.Background(), "backpressure.writer", false)
 	for i := 0; i < *capacity+50; i++ {
@@ -129,7 +159,7 @@ func summarize(path string) {
 		fmt.Fprintf(os.Stderr, "read output: %v\n", err)
 		return
 	}
-	var spans, logs int
+	var spans, logs, groups int
 	var reasons = map[string]int{}
 	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
 		if len(line) == 0 {
@@ -148,17 +178,22 @@ func summarize(path string) {
 			case "span":
 				spans++
 				var v export.SpanView
-				raw, _ := json.Marshal(rec)
-				_ = json.Unmarshal(raw, &v) // 记录在 data 内嵌时这里取外层；仅演示
-				_ = v
 				if d, ok := rec["data"]; ok {
 					_ = json.Unmarshal(d, &v)
 					reasons[v.EndReason]++
 				}
 			case "log":
 				logs++
+			case "group_summary":
+				groups++
+				var v export.GroupSummaryView
+				if d, ok := rec["data"]; ok {
+					_ = json.Unmarshal(d, &v)
+					fmt.Printf("  exported group_summary: name=%s members=%d status=%v missing=%v attrs=%v\n",
+						v.Name, v.MembersTotal, v.StatusCounts, v.MissingReasons, v.Attributes)
+				}
 			}
 		}
 	}
-	fmt.Printf("summary: spans=%d logs=%d end_reasons=%v\n", spans, logs, reasons)
+	fmt.Printf("summary: spans=%d logs=%d group_summaries=%d end_reasons=%v\n", spans, logs, groups, reasons)
 }

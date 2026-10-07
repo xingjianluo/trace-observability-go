@@ -79,4 +79,3 @@ func groupFromContext(ctx context.Context) *Group {
 	}
 	return nil
 }
-

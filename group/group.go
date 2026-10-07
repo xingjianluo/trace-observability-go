@@ -75,13 +75,26 @@ type Group struct {
 	waitOnce sync.Once
 }
 
-// New 基于父上下文创建业务组，组本身对应一个 Span（占一个层级，
-// 成员自动挂到组 Span 下）。父上下文中若已有业务组，新组会作为
-// 该父组的直接成员登记，实现嵌套。
+// New 返回 parent 上下文当前所属的业务组；若上下文中还没有业务组，
+// 则创建一个新的根组。也就是说 New 是“当前组”的获取入口：
+//   - 顶层流程（ctx 中无组）：创建新组；
+//   - 成员回调等已处于某个组内的位置：返回所属的那个组（opts 被忽略），
+//     不会意外造出一个无人收尾的孤儿组。
+//
+// 要显式创建一个嵌套子组，使用 Sub（或等价地 New(...).Sub()）。
 func New(parent context.Context, opts ...Option) *Group {
 	if parent == nil {
 		parent = context.Background()
 	}
+	if g := groupFromContext(parent); g != nil {
+		return g
+	}
+	return newGroup(parent, opts...)
+}
+
+// newGroup 总是创建一个全新的组；若 parent 上下文中已有业务组，
+// 新组的组 Span 会作为该父组的直接成员登记，实现嵌套。
+func newGroup(parent context.Context, opts ...Option) *Group {
 	o := options{name: "group"}
 	for _, fn := range opts {
 		fn(&o)
@@ -100,6 +113,11 @@ func New(parent context.Context, opts ...Option) *Group {
 	}
 	// 成员（包括成员内部再派生的子孙 Span）取到的当前组都是本 G。
 	g.ctx = contextWithGroup(g.ctx, g)
+	// 装配层的投递/汇总回执接口也要随组上下文继续向下传播：
+	// trace.StartSpan 派生的 ctx 基于父 Span 的内部 ctx，会丢掉装配层
+	// 包在外层 ctx 上的值；不重新注入的话，子组/成员回调里再创建的组
+	// 会丢失装配层，组级汇总无处可去。
+	g.ctx = ContextWithSinks(g.ctx, g.delivery, g.summarySink)
 	// 若父上下文中已有业务组，组 Span 作为父组的一个直接成员登记，
 	// 父组因此会等本组收尾，且不会与“普通成员”重复计入。
 	if pg := groupFromContext(parent); pg != nil {
@@ -132,6 +150,12 @@ func (g *Group) SetAttribute(key string, value any) {
 // 自动结束；panic 会被转为 error 终止，而不会炸掉进程或被重复统计。
 func (g *Group) Go(name string, fn func(ctx context.Context, s trace.Span)) {
 	ctx, s := trace.StartSpan(g.ctx, name)
+	// trace.StartSpan 派生的 ctx 基于父 Span 的内部 ctx，会丢掉
+	// “当前组”绑定与装配层回执接口；这里都重新注入，保证成员回调里
+	// 再派生的子组（group.New(ctx).Sub()）能正确归到本组并接上管线，
+	// 而不是成为孤儿。
+	ctx = contextWithGroup(ctx, g)
+	ctx = ContextWithSinks(ctx, g.delivery, g.summarySink)
 	g.register(s.SpanID())
 	if g.delivery != nil {
 		g.delivery.Expect(s.SpanID())
@@ -185,8 +209,9 @@ func (g *Group) Track(s trace.Span) {
 }
 
 // Sub 在本组上下文内创建嵌套子组（自动登记为本组直接成员）。
+// 与 New 不同，Sub 总是创建一个新组，即使本组上下文里已有当前组。
 func (g *Group) Sub(opts ...Option) *Group {
-	return New(g.ctx, opts...)
+	return newGroup(g.ctx, opts...)
 }
 
 // Stop 请求停止整个组：尚未结束的成员立即收到取消信号。
@@ -230,8 +255,14 @@ func (g *Group) endMember(rec trace.SpanRecord) {
 		SamplingState: rec.SamplingState,
 	}
 	if g.delivery != nil {
-		if d, ok := g.delivery.TakeDelivery(rec.SpanID); ok && !d.Accepted {
-			mr.MissingReason = d.MissingReason
+		if d, ok := g.delivery.TakeDelivery(rec.SpanID); ok {
+			if !d.Accepted {
+				mr.MissingReason = d.MissingReason
+			}
+		} else if rec.SamplingState == trace.SamplingDrop {
+			// 回执缺失（例如登记时 Span 已结束、投递发生在 Expect 之前）：
+			// 至少把“未被采样”这一事实如实记下，不能静默算作已纳入。
+			mr.MissingReason = MissingSampledOut
 		}
 	} else {
 		// 没有装配层（纯 trace 单测）时：未采样链路视为未纳入。

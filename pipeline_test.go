@@ -16,9 +16,10 @@ import (
 )
 
 type decoded struct {
-	spans map[string]export.SpanView
-	logs  []logging.Entry
-	raw   string
+	spans  map[string]export.SpanView
+	logs   []logging.Entry
+	groups []export.GroupSummaryView
+	raw    string
 }
 
 func decodeOutput(t *testing.T, data []byte) decoded {
@@ -49,6 +50,12 @@ func decodeOutput(t *testing.T, data []byte) decoded {
 					t.Fatalf("log JSON 解析失败: %v", err)
 				}
 				d.logs = append(d.logs, e)
+			case "group_summary":
+				var v export.GroupSummaryView
+				if err := json.Unmarshal(rec.Data, &v); err != nil {
+					t.Fatalf("group_summary JSON 解析失败: %v", err)
+				}
+				d.groups = append(d.groups, v)
 			}
 		}
 	}

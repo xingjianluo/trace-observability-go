@@ -40,7 +40,8 @@ type Summary struct {
 
 	// StoppedEarly 表示组是否被提前停掉（外部取消/父级取消/失败联动/超时）。
 	StoppedEarly bool
-	// StopReason 是组整体的终止原因（completed 时为空）。
+	// StopReason 是组整体的终止原因（completed / canceled / parent_canceled /
+	// deadline_exceeded / fail_fast）；StoppedEarly 在它非 completed 时为真。
 	StopReason string
 
 	// MissingCount / MissingReasons 描述“没被纳入统计”的成员数量与原因分布。

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xingjianluo/trace-observability-go/export"
+	"github.com/xingjianluo/trace-observability-go/group"
 	"github.com/xingjianluo/trace-observability-go/logging"
 	"github.com/xingjianluo/trace-observability-go/sampling"
 	"github.com/xingjianluo/trace-observability-go/trace"
@@ -35,6 +36,7 @@ type Pipeline struct {
 	exporter *export.Exporter
 	logger   *logging.Logger
 	sampler  *sampling.ThresholdSampler
+	groups   *groupSinks
 }
 
 // NewPipeline 根据配置装配管线并启动导出协程。
@@ -74,6 +76,7 @@ func NewPipeline(cfg Config) (*Pipeline, error) {
 		masker = logging.NewMasker(cfg.MaskRules)
 	}
 	p := &Pipeline{exporter: ex, sampler: s}
+	p.groups = newGroupSinks(ex, masker)
 	p.logger = logging.NewLogger(p, masker)
 	return p, nil
 }
@@ -108,12 +111,18 @@ func (p *Pipeline) StartSpan(ctx context.Context, name string, forced bool, opts
 
 	c, s := trace.StartSpan(ctx, name, opts...)
 	s.SetAttribute("sampling.decision_reason", reason)
+	// 把业务组所需的投递/汇总回执接口注入上下文：在这条 ctx 下创建的
+	// group.Group 才能向管线汇报覆盖统计、交付组级汇总。
+	c = group.ContextWithSinks(c, p.groups, p.groups)
 	return c, s
 }
 
-// onSpanEnd 是 Span 结束回调：仅把被采样（Accept）的 Span 投递到有界队列。
+// onSpanEnd 是 Span 结束回调：仅把被采样（Accept）的 Span 投递到有界队列；
+// 无论是否被采样，都会为业务组认领过的 SpanID 留下投递回执，
+// 组级汇总据此区分“实际纳入”与“未纳入（采样/队列原因）”。
 func (p *Pipeline) onSpanEnd(rec trace.SpanRecord) {
 	if rec.SamplingState != trace.SamplingAccept {
+		p.groups.recordDelivery(rec.SpanID, deliveryFor(rec, export.Result{}))
 		return
 	}
 	v := export.SpanView{
@@ -135,13 +144,14 @@ func (p *Pipeline) onSpanEnd(rec trace.SpanRecord) {
 	if err != nil {
 		return
 	}
-	_ = p.exporter.Enqueue(context.Background(), export.Record{
+	res, _ := p.exporter.Submit(context.Background(), export.Record{
 		Kind:     export.KindSpan,
 		Data:     data,
 		TraceID:  rec.TraceID,
 		SpanID:   rec.SpanID,
 		Accepted: true,
 	})
+	p.groups.recordDelivery(rec.SpanID, deliveryFor(rec, res))
 }
 
 // OnLog 实现 logging.Sink：把脱敏后的日志条目投递到有界队列。
